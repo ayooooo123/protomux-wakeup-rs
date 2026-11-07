@@ -1,0 +1,12 @@
+{
+  "name": "protomux-wakeup-rs-interop",
+  "private": true,
+  "description": "npm protomux-wakeup peer driven by tests/interop.rs",
+  "dependencies": {
+    "hypercore-crypto": "3.7.0",
+    "hyperdht": "6.36.0",
+    "hyperswarm": "4.17.2",
+    "protomux": "3.13.0",
+    "protomux-wakeup": "2.9.0"
+  }
+}

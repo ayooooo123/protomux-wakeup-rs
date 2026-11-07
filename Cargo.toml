@@ -1,0 +1,33 @@
+[package]
+name = "protomux-wakeup-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+description = "Wakeup protocol over protomux, wire-compatible with the npm protomux-wakeup module"
+keywords = ["protomux", "wakeup", "autobase", "holepunch", "p2p"]
+categories = ["network-programming"]
+
+[lib]
+name = "protomux_wakeup"
+
+[dependencies]
+bytes = "1"
+compact-encoding-rs = { path = "../compact-encoding-rs" }
+hypercore-rs = { path = "../hypercore-rs" }
+protomux-rs = { path = "../protomux-rs" }
+tokio = { version = "1.40", features = ["sync", "rt", "macros", "time"] }
+
+[build-dependencies]
+hyperschema-rs = { path = "../hyperschema-rs" }
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["full"] }
+peeroxide = "1.7.4"
+peeroxide-dht = "1.7.4"
+
+# Our fork: UDX write pipelining, C-compatible pacing and SACKs, reachability check (see ../peeroxide).
+[patch.crates-io]
+peeroxide = { path = "../peeroxide/peeroxide" }
+peeroxide-dht = { path = "../peeroxide/peeroxide-dht" }
+libudx = { path = "../peeroxide/libudx" }
