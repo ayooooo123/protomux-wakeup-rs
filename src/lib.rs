@@ -351,7 +351,9 @@ impl WakeupSwarm {
                     let mut topic = Topic::new(capability, active);
                     topic.sessions.push(session.clone());
                     vacant.insert(topic);
-                    muxers = st.muxers.clone();
+                    if active {
+                        muxers = st.muxers.clone();
+                    }
                 }
                 std::collections::hash_map::Entry::Occupied(mut occupied) => {
                     {
@@ -377,6 +379,16 @@ impl WakeupSwarm {
         self.lock()
             .topics
             .get(&id)
+            .map(|t| t.sessions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Sessions registered for an explicit topic id, including a
+    /// `SessionHandlers::discovery_key` override.
+    pub fn get_sessions_by_id(&self, id: &[u8; 32]) -> Vec<WakeupSession> {
+        self.lock()
+            .topics
+            .get(id)
             .map(|t| t.sessions.clone())
             .unwrap_or_default()
     }
@@ -462,7 +474,6 @@ struct Topic {
     is_active: bool,
     idle_ticks: u32,
     gcing: bool,
-    destroyed: bool,
 }
 
 impl Topic {
@@ -477,7 +488,6 @@ impl Topic {
             is_active: active,
             idle_ticks: 0,
             gcing: false,
-            destroyed: false,
         }
     }
 
@@ -534,7 +544,7 @@ impl Inner {
         let muxers = {
             let st = self.lock();
             match st.topics.get(id) {
-                Some(t) if t.is_active && !t.destroyed => st.muxers.clone(),
+                Some(t) if t.is_active => st.muxers.clone(),
                 _ => return,
             }
         };
@@ -553,10 +563,12 @@ impl Inner {
             let Some(topic) = st.topics.get(id) else {
                 return;
             };
-            if topic.destroyed {
-                return;
-            }
-            if !unique && topic.by_stream.iter().any(|(m, _)| same_mux(m, mux)) {
+            if !unique
+                && topic
+                    .by_stream
+                    .iter()
+                    .any(|(m, peer)| same_mux(m, mux) && !peer.0.channel.is_closed())
+            {
                 return;
             }
             let ns = if info.is_initiator { 0 } else { 1 };
@@ -588,9 +600,6 @@ impl Inner {
             let Some(topic) = st.topics.get_mut(id) else {
                 return;
             };
-            if topic.destroyed {
-                return;
-            }
             topic.pending.push(peer.clone());
             topic.by_stream.push((mux.clone(), peer.clone()));
         }
@@ -607,9 +616,7 @@ impl Inner {
         };
         let known = {
             let st = self.lock();
-            st.topics
-                .get(&id)
-                .is_some_and(|t| !t.sessions.is_empty() && !t.destroyed)
+            st.topics.get(&id).is_some_and(|t| !t.sessions.is_empty())
         };
         if known {
             self.open(&id, mux, false);
@@ -663,7 +670,10 @@ impl Inner {
             return effect;
         };
         let ns = if info.is_initiator { 1 } else { 0 };
-        if open.capability != capability(ns, &topic.capability, &handshake_hash) {
+        if !capabilities_equal(
+            &open.capability,
+            &capability(ns, &topic.capability, &handshake_hash),
+        ) {
             peer.close();
             return effect;
         }
@@ -694,7 +704,7 @@ impl Inner {
         let Some(topic) = st.topics.get_mut(id) else {
             return effect;
         };
-        topic.by_stream.retain(|(m, _)| !same_mux(m, peer.stream()));
+        topic.by_stream.retain(|(_, p)| !is_same_peer(p, peer));
         if peer.is_pending() {
             topic.pending.retain(|p| !is_same_peer(p, peer));
             return effect;
@@ -788,6 +798,9 @@ impl Inner {
         kind: u64,
         data: compact_encoding::Bytes,
     ) -> Option<Effect> {
+        if peer.is_pending() {
+            return Some(Effect::default());
+        }
         let mut reader = compact_encoding::Reader::new(data);
         Some(match kind {
             LOOKUP => self.on_lookup(id, peer, Lookup::decode(&mut reader).ok()?),
@@ -849,11 +862,28 @@ impl Inner {
         let Some(topic) = st.topics.remove(id) else {
             return;
         };
-        for peer in topic.peers.iter().chain(topic.pending.iter()) {
+        for peer in topic.peers.iter().rev().chain(topic.pending.iter().rev()) {
             peer.close();
+            if peer.is_pending() {
+                continue;
+            }
+            let active = peer.is_active();
+            if active {
+                peer.set_active(false);
+            }
+            for session in topic.sessions.iter().rev() {
+                if active {
+                    effect
+                        .callbacks
+                        .push((session.clone(), Callback::PeerInactive(peer.clone())));
+                }
+                effect
+                    .callbacks
+                    .push((session.clone(), Callback::PeerRemove(peer.clone())));
+            }
         }
         st.gc.retain(|gc| gc != id);
-        // JS runs the destroy handlers in reverse session order, like the others.
+        // JS runs destroy handlers in reverse session order, after peer removal.
         for session in topic.sessions.into_iter().rev() {
             effect.callbacks.push((session, Callback::Destroy));
         }
@@ -897,6 +927,11 @@ async fn drive(inner: Arc<Inner>, id: [u8; 32], peer: WakeupPeer, mut channel: C
             return;
         }
     }
+    if peer.is_pending() {
+        let effect = inner.remove_peer(&id, &peer);
+        inner.apply(Some(&id), effect);
+        return;
+    }
     loop {
         match channel.recv().await {
             Some(Event::Message(message)) => {
@@ -935,4 +970,11 @@ fn same_mux(a: &Mux, b: &Mux) -> bool {
 
 fn is_same_peer(a: &WakeupPeer, b: &WakeupPeer) -> bool {
     Arc::ptr_eq(&a.0, &b.0)
+}
+
+fn capabilities_equal(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter()
+        .zip(b)
+        .fold(0u8, |different, (a, b)| different | (a ^ b))
+        == 0
 }

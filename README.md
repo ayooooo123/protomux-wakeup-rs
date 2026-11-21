@@ -1,8 +1,9 @@
 # protomux-wakeup-rs
 
-[protomux-wakeup](https://github.com/holepunchto/protomux-wakeup) (2.9.0) for Rust: peers on the
+[protomux-wakeup](https://github.com/holepunchto/protomux-wakeup) 2.9.1 for Rust: peers on the
 `wakeup` Protomux protocol tell each other which writers they are missing, so an idle Autobee peer
-is woken by the peer that has new data. Wire-compatible with npm, on [`protomux-rs`](../protomux-rs).
+is woken by the peer that has new data. Wire-compatible with npm protomux-wakeup 2.9.1, on
+[protomux-rs](../protomux-rs), which implements npm protomux 3.13.1.
 
 ```rust,no_run
 use protomux_wakeup::{Lookup, SessionHandlers, WakeupSwarm, wakeup::Writer_};
@@ -33,9 +34,9 @@ session.broadcast_lookup(&Lookup { hash: None });
   registered stream; inactive topics keep their channels but new streams are not opened.
 - **GC**: a topic with no sessions and no active peers is torn down after 5 ticks (default 2 s,
   `WakeupOptions::gc_tick_time`). The timer task exists only while at least one topic waits for GC.
-  Teardown closes the channels and calls `on_destroy` for the sessions still registered; because
-  GC only starts once the last session is gone, `on_destroy` normally fires from
-  `WakeupSwarm::destroy()` with live sessions, as in JS.
+  Teardown notifies `on_peerinactive` and `on_peerremove` for live peers before calling
+  `on_destroy` for the sessions still registered; because GC only starts once the last session is
+  gone, `on_destroy` normally fires from `WakeupSwarm::destroy()` with live sessions, as in JS.
 - **Streams**: `add_stream(&Mux)` registers a mux for pairing and opens active topics on it. One
   `Mux` is one Noise stream, so a peer's `WakeupPeer::stream()` is the same handle consumers use
   for replica coupling. A mux without a Noise handshake hash cannot prove a capability and opens

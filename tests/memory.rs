@@ -3,9 +3,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use protomux::{Mux, StreamInfo, memory};
+use protomux::{ChannelOptions, Mux, StreamInfo, memory};
 use protomux_wakeup::{
-    Lookup, SessionHandlers, WakeupOptions, WakeupPeer, WakeupSession, WakeupSwarm, wakeup::Writer_,
+    Handshake, Info, Lookup, SessionHandlers, WakeupOptions, WakeupPeer, WakeupSession,
+    WakeupSwarm, wakeup::Writer_,
 };
 use tokio::sync::Notify;
 use tokio::time::timeout;
@@ -59,6 +60,10 @@ impl Log {
                 self.events.lock().unwrap()
             )
         })
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events.lock().unwrap().clone()
     }
 }
 
@@ -175,6 +180,11 @@ fn writers() -> Vec<Writer_> {
     ]
 }
 
+fn proof(capability: &[u8; 32], handshake_hash: &[u8; 64], ns: usize) -> [u8; 32] {
+    let namespace = hypercore::crypto::namespace(b"wakeup", 2);
+    hypercore::crypto::hash(&[&namespace[ns], capability, handshake_hash])
+}
+
 #[tokio::test]
 async fn announce_lookup_activity_and_close() {
     let (mux_a, mux_b) = mux_pair([0x42; 64]);
@@ -254,12 +264,16 @@ async fn gc_tears_down_idle_topic_after_five_ticks() {
     let (mux_a, mux_b) = mux_pair([0x45; 64]);
     let a = Node::new(options.clone());
     let b = Node::new(options.clone());
+    let a_session = a.session([3; 32], None, true);
+    let b_session = b.session([3; 32], None, true);
     a.swarm.add_stream(&mux_a);
     b.swarm.add_stream(&mux_b);
-    let a_session = a.session([3; 32], None, false);
-    let b_session = b.session([3; 32], None, false);
     a.log.wait_for("peeradd").await;
     b.log.wait_for("peeradd").await;
+    a_session.inactive();
+    b_session.inactive();
+    a.log.wait_for("peerinactive").await;
+    b.log.wait_for("peerinactive").await;
     assert!(!a.peer().is_active());
 
     // No sessions and no active peers left: the topic waits for the GC.
@@ -307,4 +321,145 @@ async fn unknown_topic_invokes_onwakeup() {
 /// `hypercore-crypto` discovery key, via the same computation the swarm uses.
 fn crypto_discovery_key(capability: &[u8; 32]) -> [u8; 32] {
     hypercore::crypto::discovery_key(capability)
+}
+
+#[tokio::test]
+async fn wrong_capability_batch_reaches_no_handlers() {
+    let handshake_hash = [0x47; 64];
+    let (mux_a, mux_b) = mux_pair(handshake_hash);
+    let b = Node::new(WakeupOptions::default());
+    let capability = [7; 32];
+    let session = b.session(capability, None, true);
+    b.swarm.add_stream(&mux_b);
+
+    let id = crypto_discovery_key(&capability);
+    let handshake = compact_encoding::encode(&Handshake {
+        version: 0,
+        capability: [0; 32],
+        active: true,
+    });
+    mux_a.cork();
+    let channel = mux_a
+        .open_channel(ChannelOptions {
+            id: Some(&id),
+            handshake: &handshake,
+            ..ChannelOptions::new("wakeup")
+        })
+        .unwrap();
+    channel.send(2, &Info { active: true });
+    channel.send(1, &writers());
+    channel.send(0, &Lookup { hash: None });
+    mux_a.uncork();
+
+    wait_until(
+        || session.get_peer(&mux_b).is_none(),
+        "rejected wakeup peer removal",
+    )
+    .await;
+    assert!(!b.log.has("peer"));
+    assert!(!b.log.has("lookup"));
+    assert!(!b.log.has("announce"));
+}
+
+#[tokio::test]
+async fn passive_session_does_not_open_on_existing_muxes() {
+    let (mux_a, mux_b) = mux_pair([0x48; 64]);
+    let a = Node::new(WakeupOptions::default());
+    let b = Node::new(WakeupOptions::default());
+    a.swarm.add_stream(&mux_a);
+    b.swarm.add_stream(&mux_b);
+
+    let capability = [8; 32];
+    let _session = a.session(capability, None, false);
+    let expected = format!("wakeup {}", hex(&crypto_discovery_key(&capability)));
+    assert!(
+        timeout(Duration::from_millis(100), b.log.wait_for(&expected))
+            .await
+            .is_err(),
+        "a passive session opened an existing mux"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_then_reopen_wakeup_channel_stays_live() {
+    let handshake_hash = [0x49; 64];
+    let (mux_a, mux_b) = mux_pair(handshake_hash);
+    let b = Node::new(WakeupOptions::default());
+    let capability = [9; 32];
+    let _session = b.session(capability, None, true);
+    b.swarm.add_stream(&mux_b);
+
+    let id = crypto_discovery_key(&capability);
+    let handshake = compact_encoding::encode(&Handshake {
+        version: 0,
+        capability: proof(&capability, &handshake_hash, 0),
+        active: true,
+    });
+    let first = mux_a
+        .open_channel(ChannelOptions {
+            id: Some(&id),
+            handshake: &handshake,
+            ..ChannelOptions::new("wakeup")
+        })
+        .unwrap();
+    let mut first = first;
+    first.opened().await.unwrap();
+
+    mux_a.cork();
+    first.close();
+    let mut second = mux_a
+        .open_channel(ChannelOptions {
+            id: Some(&id),
+            handshake: &handshake,
+            ..ChannelOptions::new("wakeup")
+        })
+        .unwrap();
+    mux_a.uncork();
+    assert!(
+        second.opened().await.is_some(),
+        "the reopened wakeup channel was rejected"
+    );
+}
+
+#[tokio::test]
+async fn discovery_key_override_is_available_by_id() {
+    let swarm = WakeupSwarm::new(|_, _| {});
+    let capability = [10; 32];
+    let discovery_key = [11; 32];
+    let session = swarm.session(
+        capability,
+        SessionHandlers {
+            discovery_key: Some(discovery_key),
+            ..Default::default()
+        },
+    );
+    assert!(swarm.get_sessions(&capability).is_empty());
+    assert_eq!(swarm.get_sessions_by_id(&discovery_key).len(), 1);
+    session.destroy();
+}
+
+#[tokio::test]
+async fn teardown_notifies_peers_before_destroy() {
+    let (mux_a, mux_b) = mux_pair([0x50; 64]);
+    let a = Node::new(WakeupOptions::default());
+    let b = Node::new(WakeupOptions::default());
+    let _a_session = a.session([12; 32], None, true);
+    let _b_session = b.session([12; 32], None, true);
+    a.swarm.add_stream(&mux_a);
+    b.swarm.add_stream(&mux_b);
+    b.log.wait_for("peeradd").await;
+
+    b.swarm.destroy();
+    b.log.wait_for("destroy").await;
+    let events = b.log.events();
+    let inactive = events
+        .iter()
+        .position(|event| event == "peerinactive")
+        .unwrap();
+    let removed = events
+        .iter()
+        .position(|event| event == "peerremove")
+        .unwrap();
+    let destroyed = events.iter().position(|event| event == "destroy").unwrap();
+    assert!(inactive < removed && removed < destroyed);
 }
