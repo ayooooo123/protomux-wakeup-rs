@@ -30,6 +30,11 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/hypercore-rs
           path: hypercore-rs
+      # hypercore-rs keeps its storage in a sibling crate.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/hypercore-storage-rs
+          path: hypercore-storage-rs
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/hyperschema-rs
